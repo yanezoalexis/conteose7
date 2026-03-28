@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import { supabase } from '@/lib/supabase';
 import type { Bombero, BomberoEnEmergencia, Estado, Emergencia } from '@/lib/types';
@@ -25,8 +25,8 @@ export default function TrackingPage() {
   const [miPosicion, setMiPosicion] = useState<{ lat: number; lng: number; accuracy: number } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showRegistro, setShowRegistro] = useState(false);
-  const [gpsError, setGpsError] = useState<string | null>(null);
-  const [isRegistered, setIsRegistered] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [gpsStatus, setGpsStatus] = useState<string>('Iniciando...');
   
   const watchIdRef = useRef<number | null>(null);
   const lastGpsUpload = useRef<number>(0);
@@ -37,57 +37,60 @@ export default function TrackingPage() {
 
   async function cargarDatos() {
     setIsLoading(true);
+    setError(null);
     
     try {
-      // Cargar emergencia activa
-      const { data: empData } = await supabase
+      console.log('Cargando emergencia...');
+      const { data: empData, error: empError } = await supabase
         .from('emergencias')
         .select('*')
         .eq('estado', 'ACTIVA')
         .limit(1)
         .single();
 
-        if (empData) {
-        setEmergencia(empData);
-        
-        // Cargar bomberos en emergencia
-        const { data: enfData } = await supabase
-          .from('bombero_emergencia')
-          .select('*, bombero:bomberos(*)')
-          .eq('emergencia_id', empData.id);
-
-        setBomberosEnEmergencia(enfData || []);
+      if (empError) {
+        console.error('Error emergencia:', empError);
+        setError('No se pudo cargar la emergencia');
+        setIsLoading(false);
+        return;
       }
 
-      // Cargar TODOS los bomberos disponibles
-      const { data: bomData } = await supabase
+      console.log('Emergencia:', empData);
+      setEmergencia(empData);
+
+      const { data: enfEmergData } = await supabase
+        .from('bombero_emergencia')
+        .select('*, bombero:bomberos(*)')
+        .eq('emergencia_id', empData.id);
+
+      setBomberosEnEmergencia(enfEmergData || []);
+
+      console.log('Cargando bomberos...');
+      const { data: bomData, error: bomError } = await supabase
         .from('bomberos')
         .select('*')
         .eq('es_activo', true)
         .order('nombre');
 
+      if (bomError) {
+        console.error('Error bomberos:', bomError);
+        setError('No se pudieron cargar los bomberos');
+        setIsLoading(false);
+        return;
+      }
+
+      console.log('Bomberos:', bomData);
       setBomberos(bomData || []);
 
-      // Verificar si ya está registrado
       const storedBomberoId = localStorage.getItem('bomberoId');
       if (storedBomberoId) {
         const bomberoData = bomData?.find(b => b.id === storedBomberoId);
         if (bomberoData) {
           setMiBombero(bomberoData);
           
-          // Verificar si está registrado en emergencia
-          if (empData) {
-            const { data: enfData } = await supabase
-              .from('bombero_emergencia')
-              .select('*')
-              .eq('bombero_id', storedBomberoId)
-              .eq('emergencia_id', empData.id)
-              .single();
-            
-            if (enfData) {
-              setIsRegistered(true);
-              iniciarGPS(empData.id, storedBomberoId);
-            }
+          const registro = enfEmergData?.find(e => e.bombero_id === storedBomberoId);
+          if (registro) {
+            iniciarGPS(empData.id, storedBomberoId);
           }
         } else {
           localStorage.removeItem('bomberoId');
@@ -96,50 +99,61 @@ export default function TrackingPage() {
       } else {
         setShowRegistro(true);
       }
-    } catch (error) {
-      console.error('Error cargando datos:', error);
+    } catch (err) {
+      console.error('Error general:', err);
+      setError('Error de conexión: ' + (err instanceof Error ? err.message : 'Unknown error'));
     } finally {
       setIsLoading(false);
     }
   }
 
-  async function iniciarGPS(emergenciaId: string, bomberoId: string) {
+  function iniciarGPS(emergenciaId: string, bomberoId: string) {
+    setGpsStatus('Solicitando GPS...');
+
     if (!('geolocation' in navigator)) {
-      setGpsError('GPS no disponible en este dispositivo');
+      setGpsStatus('GPS no disponible');
       return;
     }
 
-    setGpsError('Solicitando acceso a ubicación...');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGpsStatus('GPS activo');
+        const nuevaPos = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+        };
+        setMiPosicion(nuevaPos);
 
-    try {
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        (pos) => {
-          setGpsError(null);
-          const nuevaPos = {
-            lat: pos.coords.latitude,
-            lng: pos.coords.longitude,
-            accuracy: pos.coords.accuracy,
-          };
-          setMiPosicion(nuevaPos);
+        watchIdRef.current = navigator.geolocation.watchPosition(
+          (pos) => {
+            const p = {
+              lat: pos.coords.latitude,
+              lng: pos.coords.longitude,
+              accuracy: pos.coords.accuracy,
+            };
+            setMiPosicion(p);
 
-          // Subir posición cada 2 segundos
-          const now = Date.now();
-          if (now - lastGpsUpload.current >= 2000) {
-            lastGpsUpload.current = now;
-            subirPosicion(emergenciaId, bomberoId, nuevaPos);
-          }
-        },
-        (error) => {
-          let msg = 'Error de GPS';
-          if (error.code === 1) msg = 'Permite el acceso a ubicación';
-          if (error.code === 2) msg = 'GPS no disponible';
-          setGpsError(msg);
-        },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-      );
-    } catch (error) {
-      setGpsError('No se pudo iniciar GPS');
-    }
+            const now = Date.now();
+            if (now - lastGpsUpload.current >= 2000) {
+              lastGpsUpload.current = now;
+              subirPosicion(emergenciaId, bomberoId, p);
+            }
+          },
+          (err) => {
+            setGpsStatus('Error GPS: ' + err.message);
+          },
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+      },
+      (err) => {
+        let msg = 'Permiso GPS denegado';
+        if (err.code === err.POSITION_UNAVAILABLE) msg = 'GPS no disponible';
+        if (err.code === err.TIMEOUT) msg = 'GPS timeout';
+        setGpsStatus(msg);
+      },
+      { enableHighAccuracy: true, timeout: 15000 }
+    );
   }
 
   async function subirPosicion(emergenciaId: string, bomberoId: string, pos: { lat: number; lng: number; accuracy: number }) {
@@ -152,8 +166,8 @@ export default function TrackingPage() {
         precision: pos.accuracy,
         timestamp: new Date().toISOString(),
       });
-    } catch (error) {
-      console.error('Error subiendo posición:', error);
+    } catch (err) {
+      console.error('Error subiendo posición:', err);
     }
   }
 
@@ -171,43 +185,17 @@ export default function TrackingPage() {
         rol: 'Bombero',
       });
 
-      // Recargar lista
-      const { data: enfEmergData } = await supabase
-        .from('bombero_emergencia')
-        .select('*, bombero:bomberos(*)')
-        .eq('emergencia_id', emergencia.id);
-
-      setBomberosEnEmergencia(enfEmergData || []);
-      setIsRegistered(true);
-      setShowRegistro(false);
-      
-      // Iniciar GPS
-      iniciarGPS(emergencia.id, bombero.id);
-    } catch (error) {
-      console.error('Error registrando:', error);
-      alert('Error al registrarse. Intenta de nuevo.');
-    }
-  }
-
-  async function cambiarEstado(nuevoEstado: Estado) {
-    if (!miBombero || !emergencia) return;
-
-    try {
-      await supabase
-        .from('bombero_emergencia')
-        .update({ estado: nuevoEstado })
-        .eq('bombero_id', miBombero.id)
-        .eq('emergencia_id', emergencia.id);
-
-      // Recargar
       const { data } = await supabase
         .from('bombero_emergencia')
         .select('*, bombero:bomberos(*)')
         .eq('emergencia_id', emergencia.id);
 
       setBomberosEnEmergencia(data || []);
-    } catch (error) {
-      console.error('Error cambiando estado:', error);
+      setShowRegistro(false);
+      iniciarGPS(emergencia.id, bombero.id);
+    } catch (err) {
+      console.error('Error registrando:', err);
+      alert('Error al registrarse');
     }
   }
 
@@ -217,15 +205,10 @@ export default function TrackingPage() {
       navigator.geolocation.clearWatch(watchIdRef.current);
     }
     setMiBombero(null);
-    setIsRegistered(false);
     setMiPosicion(null);
     setShowRegistro(true);
+    setGpsStatus('Iniciando...');
   }
-
-  const emergenciaCoords = {
-    lat: emergencia?.latitud ?? -33.0245,
-    lng: emergencia?.longitud ?? -71.5513
-  };
 
   if (isLoading) {
     return (
@@ -233,6 +216,23 @@ export default function TrackingPage() {
         <div className="text-center">
           <div className="w-16 h-16 border-4 border-red-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
           <p className="text-gray-400">Conectando...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="h-screen w-screen bg-gray-950 flex items-center justify-center p-4">
+        <div className="text-center max-w-md">
+          <div className="w-16 h-16 bg-red-600/20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">⚠️</span>
+          </div>
+          <h2 className="text-white text-xl font-bold mb-2">Error</h2>
+          <p className="text-gray-400 mb-4">{error}</p>
+          <button onClick={cargarDatos} className="bg-blue-600 text-white px-6 py-3 rounded-xl">
+            Reintentar
+          </button>
         </div>
       </div>
     );
@@ -248,16 +248,18 @@ export default function TrackingPage() {
             </div>
             <div>
               <h1 className="text-white font-bold">ConteoSE7</h1>
-              <p className="text-gray-400 text-xs">{emergencia?.codigo || 'Sin emergencia'}</p>
+              <p className="text-gray-400 text-xs">{emergencia?.codigo}</p>
             </div>
           </div>
           
           <div className="flex items-center gap-3">
-            {miPosicion && (
-              <div className="bg-blue-900/50 px-2 py-1 rounded text-blue-300 text-xs">
-                📍 ±{Math.round(miPosicion.accuracy)}m
-              </div>
-            )}
+            <div className={`px-2 py-1 rounded text-xs ${
+              gpsStatus.includes('activo') ? 'bg-green-900/50 text-green-400' :
+              gpsStatus.includes('Error') ? 'bg-red-900/50 text-red-400' :
+              'bg-yellow-900/50 text-yellow-400'
+            }`}>
+              {gpsStatus}
+            </div>
             {miBombero && (
               <button onClick={cerrarSesion} className="text-gray-400 text-xs hover:text-white">
                 Salir
@@ -268,13 +270,7 @@ export default function TrackingPage() {
 
         {miPosicion && (
           <div className="mt-2 text-xs text-green-400">
-            ✅ Ubicación activa: {miPosicion.lat.toFixed(6)}, {miPosicion.lng.toFixed(6)}
-          </div>
-        )}
-
-        {gpsError && (
-          <div className="mt-2 text-xs text-yellow-400">
-            ⚠️ {gpsError}
+            ✅ {miPosicion.lat.toFixed(6)}, {miPosicion.lng.toFixed(6)} (±{Math.round(miPosicion.accuracy)}m)
           </div>
         )}
       </header>
@@ -282,8 +278,8 @@ export default function TrackingPage() {
       <main className="flex-1 flex overflow-hidden">
         <div className="flex-1 relative">
           <GpsMap
-            emergenciaLat={emergenciaCoords.lat}
-            emergenciaLng={emergenciaCoords.lng}
+            emergenciaLat={emergencia?.latitud ?? -33.0245}
+            emergenciaLng={emergencia?.longitud ?? -71.5513}
             miPosicion={miPosicion}
             bomberos={bomberosEnEmergencia}
           />
@@ -300,7 +296,6 @@ export default function TrackingPage() {
                 <p className="text-blue-400 text-xs font-medium">TU UBICACIÓN</p>
                 <p className="text-white font-medium">{miBombero.nombre}</p>
                 <p className="text-gray-400 text-xs">{miBombero.grado}</p>
-                {isRegistered && <p className="text-green-400 text-xs mt-1">✓ Registrado</p>}
               </div>
             )}
 
@@ -315,31 +310,9 @@ export default function TrackingPage() {
                     <p className="text-xs" style={{ color: ESTADO_COLORS[b.estado] }}>{b.estado}</p>
                   </div>
                 </div>
-                {b.ultima_posicion && (
-                  <p className="text-gray-500 text-xs mt-2">
-                    📍 {b.ultima_posicion.latitud.toFixed(6)}, {b.ultima_posicion.longitud.toFixed(6)}
-                  </p>
-                )}
               </div>
             ))}
           </div>
-
-          {miBombero && isRegistered && (
-            <div className="p-4 border-t border-gray-800">
-              <button
-                onClick={() => {
-                  const estados: Estado[] = ['OK', 'CANSADO', 'AGOTADO', 'LESIONADO'];
-                  const estadoActual = bomberosEnEmergencia.find(b => b.bombero_id === miBombero.id)?.estado || 'OK';
-                  const idxActual = estados.indexOf(estadoActual);
-                  const siguiente = estados[(idxActual + 1) % estados.length];
-                  cambiarEstado(siguiente);
-                }}
-                className="w-full bg-red-600 text-white font-semibold py-3 rounded-xl"
-              >
-                Cambiar Mi Estado
-              </button>
-            </div>
-          )}
         </aside>
       </main>
 
@@ -351,9 +324,7 @@ export default function TrackingPage() {
                 <span className="text-3xl">🚒</span>
               </div>
               <h2 className="text-white text-xl font-bold">¿Quién eres?</h2>
-              <p className="text-gray-400 text-sm mt-2">
-                Selecciona tu nombre para registrarte en la emergencia
-              </p>
+              <p className="text-gray-400 text-sm mt-2">Selecciona tu nombre</p>
             </div>
             
             <div className="space-y-2 max-h-96 overflow-y-auto">
@@ -377,17 +348,9 @@ export default function TrackingPage() {
             {bomberos.length === 0 && (
               <div className="text-center py-8 text-gray-500">
                 <p>No hay bomberos registrados</p>
-                <p className="text-xs mt-2">Agrega datos en Supabase</p>
               </div>
             )}
           </div>
-        </div>
-      )}
-
-      {gpsError && gpsError.includes('Permite') && (
-        <div className="fixed bottom-4 left-4 right-4 md:left-auto md:right-4 md:w-80 bg-yellow-900 text-white p-4 rounded-xl z-50">
-          <p className="font-semibold">📍 Se necesita permiso de ubicación</p>
-          <p className="text-sm mt-1">Toca el ícono de ubicación en tu navegador y permite el acceso</p>
         </div>
       )}
     </div>
